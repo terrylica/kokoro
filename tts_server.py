@@ -98,22 +98,38 @@ def to_wav_bytes(audio: np.ndarray) -> bytes:
     return buf.getvalue()
 
 
+_playback_queue_depth = 0
+_PLAYBACK_MAX_QUEUE = 2  # drop audio if more than 2 items queued
+
 def play_locally(wav_bytes: bytes) -> None:
-    """Play via afplay on macOS (blocking — serialised by _playback_lock)."""
+    """Play via afplay on macOS (blocking — serialised by _playback_lock).
+    Drops audio if queue backs up to prevent CoreAudio contention that freezes UI."""
+    global _playback_queue_depth
     if not PLAY_LOCAL:
         return
 
-    with _playback_lock:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(wav_bytes)
-            tmp = f.name
-        try:
-            subprocess.run(["afplay", tmp], check=False)
-        finally:
+    _playback_queue_depth += 1
+    if _playback_queue_depth > _PLAYBACK_MAX_QUEUE:
+        _playback_queue_depth -= 1
+        print(f"[kokoro-tts] dropping audio — queue depth {_playback_queue_depth + 1} exceeds max {_PLAYBACK_MAX_QUEUE}", flush=True)
+        return
+
+    try:
+        with _playback_lock:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+                f.write(wav_bytes)
+                tmp = f.name
             try:
-                os.unlink(tmp)
-            except OSError:
-                pass
+                subprocess.run(["afplay", tmp], check=False, timeout=30)
+            except subprocess.TimeoutExpired:
+                print("[kokoro-tts] afplay timeout — killing stuck playback", flush=True)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+    finally:
+        _playback_queue_depth -= 1
 
 
 def _ffmpeg_convert(wav_bytes: bytes, out_ext: str, codec_args: list[str]) -> bytes | None:
